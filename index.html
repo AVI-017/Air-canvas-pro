@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Air Canvas Pro - Precision & Undo</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #0a0a0a; font-family: 'Segoe UI', sans-serif; }
+        canvas { position: absolute; top: 0; left: 0; }
+        #video { transform: scaleX(-1); visibility: hidden; width: 640px; height: 480px; }
+        
+        #ui { position: fixed; top: 20px; left: 20px; color: #fff; z-index: 10; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 12px; border: 1px solid #444; pointer-events: none; }
+        #palette { position: fixed; right: 20px; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column; gap: 15px; z-index: 20; background: rgba(255,255,255,0.1); padding: 15px; border-radius: 50px; }
+        .color-circle { width: 40px; height: 40px; border-radius: 50%; border: 2px solid white; }
+        
+        .v-btn { 
+            position: fixed; right: 100px; width: 120px; height: 50px; 
+            color: white; border: 3px solid white; border-radius: 10px;
+            display: flex; align-items: center; justify-content: center; font-weight: bold; z-index: 30; 
+        }
+        #confirm-btn { top: 20px; background: #ff4444; display: none; }
+        #undo-btn { top: 80px; background: #555; }
+
+        #flash { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: white; opacity: 0; z-index: 100; pointer-events: none; transition: opacity 0.15s; }
+    </style>
+</head>
+<body>
+    <div id="flash"></div>
+    <div id="confirm-btn" class="v-btn">CONFIRM 📸</div>
+    <div id="undo-btn" class="v-btn">UNDO ↩️</div>
+    
+    <div id="ui">
+        <h2 style="margin:0; color: #00ffcc;">Air Canvas Pro</h2>
+        <p>☝️ <b>Draw:</b> Index Up | 🤏 <b>Pinch:</b> Drag or UI<br>
+           ✊ <b>Eraser:</b> Fist (Small) | 🤟 <b>Photo:</b> Show 🤟</p>
+    </div>
+
+    <div id="palette">
+        <div class="color-circle" style="background: #00ffcc;" data-color="#00ffcc"></div>
+        <div class="color-circle" style="background: #ff4444;" data-color="#ff4444"></div>
+        <div class="color-circle" style="background: #ffea00;" data-color="#ffea00"></div>
+        <div class="color-circle" style="background: #ffffff;" data-color="#ffffff"></div>
+    </div>
+
+    <video id="video" playsinline></video>
+    <canvas id="canvas"></canvas>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const flash = document.getElementById('flash');
+const confirmBtn = document.getElementById('confirm-btn');
+const undoBtn = document.getElementById('undo-btn');
+
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+let strokes = []; 
+let currentStroke = null;
+let grabbedStrokeIndex = -1;
+let lastHandPos = { x: 0, y: 0 };
+let currentColor = "#00ffcc";
+let snapshotCooldown = false;
+let uiCooldown = false;
+
+function getDist(p1, p2) {
+    return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+}
+
+function checkUICollision(x, y, element) {
+    const rect = element.getBoundingClientRect();
+    return (x > rect.left && x < rect.right && y > rect.top && y < rect.bottom);
+}
+
+function takeSnapshot() {
+    if (snapshotCooldown) return;
+    snapshotCooldown = true;
+    flash.style.opacity = "1";
+    setTimeout(() => flash.style.opacity = "0", 150);
+    const link = document.createElement('a');
+    link.download = 'air-canvas-art.png';
+    link.href = canvas.toDataURL();
+    link.click();
+    confirmBtn.style.display = "none";
+    setTimeout(() => snapshotCooldown = false, 2000);
+}
+
+function undo() {
+    if (uiCooldown) return;
+    uiCooldown = true;
+    strokes.pop();
+    setTimeout(() => uiCooldown = false, 500); // Prevent rapid multiple undos
+}
+
+function onResults(results) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const hand = results.multiHandLandmarks[0];
+        const mirroredHand = hand.map(l => ({ ...l, x: 1 - l.x }));
+
+        const thumbTip = mirroredHand[4];
+        const indexTip = mirroredHand[8];
+        const middleTip = mirroredHand[12];
+        const pinkyTip = mirroredHand[20];
+        const wrist = mirroredHand[0];
+
+        const x = indexTip.x * canvas.width;
+        const y = indexTip.y * canvas.height;
+        const handSize = getDist(wrist, mirroredHand[9]); 
+        const dynamicWidth = Math.max(1.5, handSize * 35); 
+
+        const isThumbUp = getDist(thumbTip, wrist) > 0.25;
+        const isIndexUp = getDist(indexTip, wrist) > getDist(mirroredHand[6], wrist);
+        const isMiddleUp = getDist(middleTip, wrist) > getDist(mirroredHand[10], wrist);
+        const isPinkyUp = getDist(pinkyTip, wrist) > getDist(mirroredHand[18], wrist);
+        const isPinching = getDist(thumbTip, indexTip) < 0.04;
+
+        // Visual Hand Skeleton
+        drawConnectors(ctx, mirroredHand, HAND_CONNECTIONS, {color: '#ffffff22', lineWidth: 1});
+        drawLandmarks(ctx, mirroredHand, {color: currentColor, lineWidth: 1, radius: 3});
+
+        // Palette Check
+        const buttons = document.querySelectorAll('.color-circle');
+        buttons.forEach(btn => {
+            const rect = btn.getBoundingClientRect();
+            if (getDist(indexTip, {x: (rect.left+20)/canvas.width, y: (rect.top+20)/canvas.height}) < 0.03) {
+                currentColor = btn.getAttribute('data-color');
+            }
+        });
+
+        // 1. ERASER (Fist) - Smaller Circle
+        const isFist = !isIndexUp && !isMiddleUp && !isPinkyUp;
+        if (isFist) {
+            confirmBtn.style.display = "none";
+            const eraserRadius = 25; // Smaller radius as requested
+            ctx.beginPath();
+            ctx.arc(x, y, eraserRadius, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(255, 0, 0, 0.3)";
+            ctx.fill();
+            ctx.strokeStyle = "red";
+            ctx.stroke();
+
+            strokes = strokes.filter(s => !s.points.some(p => getDist(p, {x, y}) < eraserRadius));
+        } 
+        // 2. SNAPSHOT UI TOGGLE
+        else if (isThumbUp && isIndexUp && isPinkyUp && !isMiddleUp) {
+            confirmBtn.style.display = "flex";
+        }
+        // 3. UI PINCH ACTIONS (Undo & Confirm)
+        else if (isPinching) {
+            if (checkUICollision(x, y, undoBtn)) {
+                undo();
+            } else if (confirmBtn.style.display === "flex" && checkUICollision(x, y, confirmBtn)) {
+                takeSnapshot();
+            } else {
+                // Drag Logic
+                if (grabbedStrokeIndex === -1) {
+                    grabbedStrokeIndex = strokes.findIndex(s => s.points.some(p => getDist(indexTip, {x: p.x/canvas.width, y: p.y/canvas.height}) < 0.04));
+                }
+                if (grabbedStrokeIndex !== -1) {
+                    const dx = x - lastHandPos.x;
+                    const dy = y - lastHandPos.y;
+                    strokes[grabbedStrokeIndex].points.forEach(p => { p.x += dx; p.y += dy; });
+                }
+            }
+        } 
+        // 4. DRAWING
+        else if (isIndexUp && !isMiddleUp) {
+            if (!currentStroke) {
+                currentStroke = { points: [], color: currentColor, width: dynamicWidth };
+                strokes.push(currentStroke);
+            }
+            currentStroke.points.push({x, y});
+        } else {
+            currentStroke = null;
+            grabbedStrokeIndex = -1;
+        }
+        lastHandPos = { x, y };
+    }
+
+    // RENDER
+    strokes.forEach(stroke => {
+        ctx.strokeStyle = stroke.color;
+        ctx.lineWidth = stroke.width;
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.beginPath();
+        stroke.points.forEach((p, i) => {
+            if (i === 0) ctx.moveTo(p.x, p.y);
+            else ctx.lineTo(p.x, p.y);
+        });
+        ctx.stroke();
+    });
+}
+
+const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.8, minTrackingConfidence: 0.8 });
+hands.onResults(onResults);
+
+const camera = new Camera(video, {
+    onFrame: async () => { await hands.send({image: video}); },
+    width: 1280, height: 720
+});
+camera.start();
+</script>
+</body>
+</html>
